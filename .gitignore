@@ -1,0 +1,14 @@
+
+# Python virtual environment
+venv/
+
+# Mac files
+.DS_Store
+
+# Output files
+*.xlsx
+*.csv
+
+# Jupyter
+.ipynb_checkpoints
+
