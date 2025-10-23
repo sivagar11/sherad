@@ -22,6 +22,11 @@ W_BLUE_IMBALANCE = 2
 W_R6_BAL = 3
 W_R6_MIX = 3
 
+# --- NEW: R-7 batching weights (per minute of gap) ---
+W_SETUP_INK = 0.05  # ink reuse benefit
+W_SETUP_STEREO = 0.07  # stereo (plate) reuse benefit
+W_SETUP_FORM = 0.10  # cutting die reuse benefit
+
 BLUE_IMBALANCE_HARD_CAP = None
 HBUFFER_DAYS = 4
 
@@ -115,6 +120,38 @@ def same_family(m):
     )
 
 
+def build_ink_signature(row):
+    """Create a normalized tuple of non-null ink codes across COLCODE1..COLCODE7."""
+    codes = []
+    for k in range(1, 8):
+        col = f"COLCODE{k}"
+        if col in row and pd.notna(row[col]) and str(row[col]).strip() != "":
+            codes.append(str(row[col]).strip())
+    if not codes:
+        return None
+    # Keep order to represent exact set; alternative is frozenset if order irrelevant
+    return tuple(codes)
+
+
+def build_stereo_signature(row):
+    """Take first non-null STEREO* code as signature."""
+    for k in range(1, 4):  # support STEREO1..STEREO3 if present
+        col = f"STEREO{k}"
+        if col in row and pd.notna(row[col]) and str(row[col]).strip() != "":
+            return str(row[col]).strip()
+    return None
+
+
+def build_form_signature(row):
+    """Use ORIGINATION if starts with 'GF' (Göpfert die)."""
+    val = row.get("ORIGINATION", None)
+    if pd.notna(val):
+        s = str(val).strip()
+        if s.upper().startswith("GF"):
+            return s.upper()
+    return None
+
+
 # =========================================================
 # LOAD DATA
 # =========================================================
@@ -171,11 +208,15 @@ df["BOARD_ARRIVAL_USED"] = (
 df["PLANSTARTDATE"] = pd.to_datetime(df.get("PLANSTARTDATE", pd.NaT), errors="coerce")
 df[["IS_EASY", "IS_HARD"]] = df.apply(classify_complexity, axis=1, result_type="expand")
 
+# --- Build setup signatures (R-7) ---
+df["INK_SIG"] = df.apply(build_ink_signature, axis=1)
+df["STEREO_SIG"] = df.apply(build_stereo_signature, axis=1)
+df["FORM_SIG"] = df.apply(build_form_signature, axis=1)
+
 # =========================================================
 # R-5 PREPROCESSING: Pair small printed sheets (<3k feeds, COLCOUNT ≤2)
-#  - Prefer pairing within same machine; else within same family (G1/G2)
-#  - Create a single "batched" surrogate job (sum QUANTITY, max COLCOUNT),
-#    ORDERNO = "BATCH{n}:[id1+id2+...]"
+#  - Prefer pairing within same machine family (G1/G2)
+#  - Create a single "batched" surrogate job (sum QUANTITY, keep COLCOUNT≤2)
 # =========================================================
 printed_mask = (df["COLCOUNT"].fillna(0) <= 2) & (df["QUANTITY"] < 3000)
 printed_small = df[printed_mask].copy()
@@ -184,53 +225,64 @@ batch_rows = []
 used = set()
 batch_id_seq = 1
 
-# Build index by machine; fallback by family
-df["MACHINE_FAMILY"] = df["MACHCODE"].map(same_family)
+
+def family_of(m):
+    return (
+        "G1" if m in TARGET_MACHINES_G1 else ("G2" if m in TARGET_MACHINES_G2 else "X")
+    )
+
+
+df["_FAMILY"] = df["MACHCODE"].map(family_of)
 
 for fam in ["G1", "G2"]:
-    fam_df = printed_small[df["MACHINE_FAMILY"] == fam].sort_values("DUEDATE")
+    fam_df = printed_small[df["_FAMILY"] == fam].sort_values("DUEDATE")
     ids = list(fam_df.index)
     i = 0
     while i < len(ids):
         if ids[i] in used:
             i += 1
             continue
-        # start new batch
         take = [ids[i]]
         qty_sum = float(df.loc[ids[i], "QUANTITY"])
         j = i + 1
-        # greedily add until >= 5000 or run out
         while j < len(ids) and qty_sum < 5000:
             if ids[j] not in used:
                 take.append(ids[j])
                 qty_sum += float(df.loc[ids[j], "QUANTITY"])
             j += 1
-        # materialize batch only if >= 5000
         if qty_sum >= 5000 and len(take) >= 2:
             used.update(take)
             rows = df.loc[take]
             order_str = "+".join(rows["ORDERNO"].astype(str).tolist())
             batch_orderno = f"BATCH{batch_id_seq}:{order_str}"
             batch_id_seq += 1
-            # representative machine & attributes (take first)
             r0 = rows.iloc[0].copy()
             r0["ORDERNO"] = batch_orderno
             r0["QUANTITY"] = qty_sum
             r0["DURATION_MIN"] = int(qty_sum / FEEDS_PER_MIN)
-            r0["COLCOUNT"] = min(rows["COLCOUNT"].min(), 2)  # keep as printed sheet
+            r0["COLCOUNT"] = min(rows["COLCOUNT"].min(), 2)
             r0["IS_EASY"], r0["IS_HARD"] = classify_complexity(r0)
-            # conservative DUEDATE/BOARD/PLAN from the worst (latest due, latest board, earliest plan freeze)
             r0["DUEDATE"] = rows["DUEDATE"].max()
             r0["BOARD_ARRIVAL_USED"] = rows["BOARD_ARRIVAL_USED"].max()
             r0["PLANSTARTDATE"] = pd.to_datetime(rows["PLANSTARTDATE"]).min()
             r0["PROC_COUNT"] = int(rows["PROC_COUNT"].max())
+            # keep setup signatures if identical; else drop (None) so R-7 doesn't force them
+            r0["INK_SIG"] = (
+                rows["INK_SIG"].iloc[0] if (rows["INK_SIG"].nunique() == 1) else None
+            )
+            r0["STEREO_SIG"] = (
+                rows["STEREO_SIG"].iloc[0]
+                if (rows["STEREO_SIG"].nunique() == 1)
+                else None
+            )
+            r0["FORM_SIG"] = (
+                rows["FORM_SIG"].iloc[0] if (rows["FORM_SIG"].nunique() == 1) else None
+            )
             batch_rows.append(r0)
-
         i = j
 
 if batch_rows:
     batch_df = pd.DataFrame(batch_rows).reset_index(drop=True)
-    # remove used originals, append batched
     df = pd.concat([df.drop(index=list(used)), batch_df], ignore_index=True)
     print(
         f"R-5: paired {len(used)} small printed-sheet jobs into {len(batch_df)} batches."
@@ -290,7 +342,6 @@ for idx, row in df.iterrows():
         model.Add(end_mod >= win_low)
         model.Add(end_mod <= win_high)
     elif colour == "green" and win_low is not None:
-        # soft: penalize distance if outside
         too_early = model.NewIntVar(0, 24 * 60, f"win_early_{job_id}")
         too_late = model.NewIntVar(0, 24 * 60, f"win_late_{job_id}")
         model.Add(too_early >= win_low - end_mod)
@@ -298,9 +349,6 @@ for idx, row in df.iterrows():
         win_viol = model.NewIntVar(0, 24 * 60, f"win_viol_{job_id}")
         model.AddMaxEquality(win_viol, [too_early, too_late])
         green_window_viols.append(win_viol)
-    else:
-        # brown/unknown: no constraint, no penalty
-        pass
 
     # R-2: HARD board arrival -> start cannot be before board ready
     ba_dt = row["BOARD_ARRIVAL_USED"]
@@ -395,7 +443,88 @@ for m, ivs in machine_to_intervals.items():
         model.AddNoOverlap(ivs)
 
 # =========================================================
-# OBJECTIVE (W_R6_BAL + W_R6_MIX + blue balance + freeze soft + green window soft)
+# R-7 SOFT BATCHING: minimize gaps between same-group jobs on the same machine
+# We build pairwise order/gap variables only for pairs that share a setup signature
+# and are on the same machine (machine assignments are fixed in data).
+# =========================================================
+setup_gap_terms = []
+job_indices = list(df.index)
+
+# Pre-compute signatures for quick access
+INK_SIGS = df["INK_SIG"].to_dict()
+STEREO_SIGS = df["STEREO_SIG"].to_dict()
+FORM_SIGS = df["FORM_SIG"].to_dict()
+MACH = df["MACHCODE"].to_dict()
+
+for a_i in range(len(job_indices)):
+    i = job_indices[a_i]
+    for a_j in range(a_i + 1, len(job_indices)):
+        j = job_indices[a_j]
+
+        # same machine only
+        if MACH[i] != MACH[j]:
+            continue
+
+        same_ink = (INK_SIGS.get(i) is not None) and (
+            INK_SIGS.get(i) == INK_SIGS.get(j)
+        )
+        same_stereo = (STEREO_SIGS.get(i) is not None) and (
+            STEREO_SIGS.get(i) == STEREO_SIGS.get(j)
+        )
+        same_form = (FORM_SIGS.get(i) is not None) and (
+            FORM_SIGS.get(i) == FORM_SIGS.get(j)
+        )
+
+        # combined weight
+        pair_w = 0.0
+        if same_ink:
+            pair_w += W_SETUP_INK
+        if same_stereo:
+            pair_w += W_SETUP_STEREO
+        if same_form:
+            pair_w += W_SETUP_FORM
+
+        if pair_w <= 0.0:
+            continue  # nothing to batch for this pair
+
+        # Order variables: exactly one of (i before j) or (j before i)
+        o_ij = model.NewBoolVar(f"o_{i}_before_{j}")
+        o_ji = model.NewBoolVar(f"o_{j}_before_{i}")
+        model.Add(o_ij + o_ji == 1)
+
+        # gap if i before j : start_j - end_i
+        gap_ij = model.NewIntVar(0, H_MIN, f"gap_{i}_to_{j}")
+        # gap if j before i : start_i - end_j
+        gap_ji = model.NewIntVar(0, H_MIN, f"gap_{j}_to_{i}")
+
+        # Linearization with big-M
+        # When o_ij = 1 => start_j >= end_i and gap_ij == start_j - end_i
+        model.Add(start_vars[j] - end_vars[i] >= 0).OnlyEnforceIf(o_ij)
+        model.Add(gap_ij == start_vars[j] - end_vars[i]).OnlyEnforceIf(o_ij)
+        # When o_ij = 0 => gap_ij = 0 (inactive)
+        model.Add(gap_ij == 0).OnlyEnforceIf(o_ij.Not())
+
+        # Similarly for j before i
+        model.Add(start_vars[i] - end_vars[j] >= 0).OnlyEnforceIf(o_ji)
+        model.Add(gap_ji == start_vars[i] - end_vars[j]).OnlyEnforceIf(o_ji)
+        model.Add(gap_ji == 0).OnlyEnforceIf(o_ji.Not())
+
+        # Effective gap = whichever order is active
+        eff_gap = model.NewIntVar(0, H_MIN, f"eff_gap_{i}_{j}")
+        model.Add(eff_gap == gap_ij + gap_ji)
+
+        # Add weighted gap to objective (minimize)
+        if pair_w == int(pair_w):
+            # integer weight
+            setup_gap_terms.append(int(pair_w) * eff_gap)
+        else:
+            # scale to avoid float weights: multiply both sides by 100
+            scaled = model.NewIntVar(0, 100 * H_MIN, f"scaled_gap_{i}_{j}")
+            model.Add(scaled == int(round(100 * pair_w)) * eff_gap)
+            setup_gap_terms.append(scaled)
+
+# =========================================================
+# OBJECTIVE (R-6 + blue balance + freeze soft + green window soft + R-7)
 # =========================================================
 green_window_total = safe_sum(model, green_window_viols, "green_window_soft")
 freeze_soft_total = safe_sum(model, freeze_soft_devs, "freeze_soft_total")
@@ -431,7 +560,6 @@ for m in TARGET_MACHINES:
     model.Add(day_count_m >= 2).OnlyEnforceIf(has2_day)
     model.Add(day_count_m <= 1).OnlyEnforceIf(has2_day.Not())
 
-    # Create comparison literals
     no_easy_day_cond = model.NewBoolVar(f"{m}_no_easy_day_cond")
     model.Add(day_easy_sum == 0).OnlyEnforceIf(no_easy_day_cond)
     model.Add(day_easy_sum != 0).OnlyEnforceIf(no_easy_day_cond.Not())
@@ -440,7 +568,6 @@ for m in TARGET_MACHINES:
     model.Add(day_hard_sum == 0).OnlyEnforceIf(no_hard_day_cond)
     model.Add(day_hard_sum != 0).OnlyEnforceIf(no_hard_day_cond.Not())
 
-    # Combine with has2_day
     no_easy_day_pen = model.NewBoolVar(f"{m}_no_easy_day_pen")
     model.AddBoolAnd([has2_day, no_easy_day_cond]).OnlyEnforceIf(no_easy_day_pen)
     model.AddBoolOr([has2_day.Not(), no_easy_day_cond.Not()]).OnlyEnforceIf(
@@ -487,14 +614,19 @@ for m in TARGET_MACHINES:
 
 r6_pen_sum = safe_sum(model, r6_terms, "r6_pen_sum")
 
+# R-7 total setup gap penalty
+setup_gap_total = safe_sum(model, setup_gap_terms, "setup_gap_total")
+
 # Final objective
-obj = model.NewIntVar(0, 10**12, "obj")
+obj = model.NewIntVar(0, 10**15, "obj")
+# Note: setup_gap_total might be scaled by 100 internally; that's fine as it's relative.
 model.Add(
     obj
     == W_WINDOW_SOFT * green_window_total
     + W_FREEZE_SOFT * freeze_soft_total
     + W_BLUE_IMBALANCE * imbalance_abs
     + r6_pen_sum
+    + setup_gap_total
 )
 model.Minimize(obj)
 
@@ -516,7 +648,8 @@ if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         f"✅ Solution: green_win={solver.Value(green_window_total)} "
         f"freeze_soft={solver.Value(freeze_soft_total)} "
         f"blue_imbalance={solver.Value(imbalance_abs)} "
-        f"r6_pen={solver.Value(r6_pen_sum)}"
+        f"r6_pen={solver.Value(r6_pen_sum)} "
+        f"setup_gap={solver.Value(setup_gap_total)}"
     )
 
     rows = []
@@ -537,10 +670,13 @@ if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 "PROC_COUNT": df.loc[j, "PROC_COUNT"],
                 "IS_EASY": df.loc[j, "IS_EASY"],
                 "IS_HARD": df.loc[j, "IS_HARD"],
+                "INK_SIG": df.loc[j, "INK_SIG"],
+                "STEREO_SIG": df.loc[j, "STEREO_SIG"],
+                "FORM_SIG": df.loc[j, "FORM_SIG"],
             }
         )
     out = pd.DataFrame(rows).sort_values(["Start", "Machine"])
-    out.to_excel("schedule_output_r1to6_final.xlsx", index=False)
-    print("📁 Schedule saved to schedule_output_r1to6_final.xlsx")
+    out.to_excel("schedule_output_r1to7_final.xlsx", index=False)
+    print("📁 Schedule saved to schedule_output_r1to7_final.xlsx")
 else:
     print("❌ No feasible solution found. Status:", solver.StatusName(status))
