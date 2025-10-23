@@ -3,122 +3,136 @@ import numpy as np
 from datetime import datetime, timedelta
 import random
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
-N_JOBS = 30
-OUTPUT_PATH = "/Users/sivagar/Desktop/sherad/data/synthetic_jobs_r1to6_full.xlsx"
+OUTPUT_PATH = "/Users/sivagar/Desktop/sherad/data/synthetic_jobs_r1to6_v2_1.xlsx"
+N_JOBS = 44  # a little larger to exercise R-6
+MACHINES = ["GPO", "GOP", "GO2", "GP2"]
+COLOURS = ["White", "Blue", "Red"]
 
-random.seed(42)
-np.random.seed(42)
+EASY_FRAC, MEDIUM_FRAC, HARD_FRAC = 0.25, 0.40, 0.35  # slightly fewer "hard" than v2
 
-# Machine sets
-G1_MACHINES = ["GPO", "GOP"]  # Göpfert 1 variants
-G2_MACHINES = ["GO2", "GP2"]  # Göpfert 2 variants
-ALL_MACHINES = G1_MACHINES + G2_MACHINES
+start_date = datetime(2025, 6, 15)
+end_date = datetime(2025, 7, 1)
+span_days = (end_date - start_date).days
 
-COLOURS = ["Blue", "Red", "White"]
+random.seed(7)
+np.random.seed(7)
 
-# Generate random due dates in realistic window
-start_due = datetime(2025, 6, 15)
-end_due = datetime(2025, 6, 30)
+# caps to avoid overloading a single machine with ≥6-colour jobs
+MAX_HIGH_COLOUR_PER_MACHINE = 4
 
-
-def random_due_date():
-    delta_days = random.randint(0, (end_due - start_due).days)
-    return start_due + timedelta(days=delta_days)
+per_machine_high = {m: 0 for m in MACHINES}
+rows = []
 
 
-# =========================================================
-# JOB GENERATION
-# =========================================================
-records = []
+def pick_machine(colcount):
+    # try to distribute ≥6-colour jobs across machines, biased to G1
+    if colcount >= 6:
+        # prefer GOP/GPO, but respect caps
+        choices = ["GPO", "GOP", "GO2", "GP2"]
+        choices.sort(key=lambda m: (m not in ("GPO", "GOP"), per_machine_high[m]))
+        for m in choices:
+            if per_machine_high[m] < MAX_HIGH_COLOUR_PER_MACHINE:
+                per_machine_high[m] += 1
+                return m
+        return "GPO"
+    else:
+        return random.choice(MACHINES)
+
 
 for i in range(N_JOBS):
-    orderno = 20000 + i
-    colour = random.choice(COLOURS)
-
-    # Quantity variation (3k to 30k feeds)
-    qty = random.choice([3000, 6000, 9000, 12000, 15000, 18000, 24000, 30000])
-
-    # Colour count variation (1–7)
-    colcount = random.choice([1, 2, 3, 4, 5, 6, 7])
-
-    # Assign machine according to colour complexity (for R-4)
-    if colcount >= 6:
-        machcode = random.choice(G1_MACHINES)  # forced to Göpfert 1
+    orderno = 21000 + i + 1
+    # complexity tier
+    tier = np.random.choice(
+        ["easy", "medium", "hard"], p=[EASY_FRAC, MEDIUM_FRAC, HARD_FRAC]
+    )
+    if tier == "easy":
+        qty = np.random.randint(1200, 3000)
+        colcount = np.random.randint(1, 3)
+    elif tier == "medium":
+        qty = np.random.randint(3200, 12000)
+        colcount = np.random.randint(3, 5)
     else:
-        machcode = random.choice(ALL_MACHINES)
+        qty = np.random.randint(12000, 26000)
+        colcount = np.random.randint(5, 8)
 
-    # JOBSTATUSID mapping: Blue=1, Red=2, White=33
-    jobstatusid = 1 if colour == "Blue" else (2 if colour == "Red" else 33)
+    colour = np.random.choice(
+        COLOURS, p=[0.45, 0.35, 0.20]
+    )  # a bit more White/Blue than Red
+    machine = pick_machine(colcount)
 
-    # Random process count (1–3)
-    proc_count = random.randint(1, 3)
+    # spread due dates; push big jobs away from the earliest days
+    due_offset = np.random.randint(0, span_days)
+    if colcount >= 6 or qty > 18000:
+        due_offset = max(due_offset, 5)  # avoid cramming the first week
+    duedate = start_date + timedelta(days=due_offset)
 
-    duedate = random_due_date().replace(hour=0, minute=0, second=0, microsecond=0)
+    # process count & planstart
+    proc = np.random.choice([1, 2, 3], p=[0.5, 0.3, 0.2])
+    planstart = (
+        duedate
+        - timedelta(days=np.random.randint(2, 7))
+        + timedelta(hours=np.random.randint(0, 12))
+    )
 
-    # Board arrival date (R-2)
-    board_arrival = duedate - timedelta(days=proc_count + 1)
-    board_arrival_used = board_arrival.replace(hour=17, minute=0)
+    # board arrival = duedate - (proc+1..proc+3) days
+    board_days_back = int(proc + np.random.randint(1, 3))  # Ensure it's a Python int
+    board_date = duedate - timedelta(days=board_days_back)
 
-    # Duration in minutes (based on feeds/min = 60)
     duration_min = max(1, int(qty / 60))
+    is_easy = int(tier == "easy")
+    is_hard = int(tier == "hard")
+    freeze_flag = np.random.choice(["Y", "N"], p=[0.35, 0.65])
 
-    # Randomly create process codes
-    machine1a = "PROC" if proc_count >= 1 else ""
-    machine1b = "PROC" if proc_count >= 2 else ""
-    machine1c = "PROC" if proc_count >= 3 else ""
-
-    # Freeze logic (R-3): some within 5h, some 24h, some >24h
-    freeze_type = random.choice(["hard", "soft", "none"])
-    if freeze_type == "hard":
-        planstartdate = datetime.now() + timedelta(
-            hours=random.randint(1, 4)
-        )  # within 5h
-        freeze_flag = "Y"
-    elif freeze_type == "soft":
-        planstartdate = datetime.now() + timedelta(
-            hours=random.randint(6, 20)
-        )  # within 24h
-        freeze_flag = "Y"
-    else:
-        planstartdate = duedate - timedelta(days=random.randint(2, 5))
-        freeze_flag = "N"
-
-    # Complexity flags (R-6)
-    is_easy = int(qty < 8000 and colcount <= 3)
-    is_hard = int(qty >= 12000 or colcount >= 5)
-
-    records.append(
+    rows.append(
         {
             "ORDERNO": orderno,
-            "MACHCODE": machcode,
-            "JOBSTATUSID": jobstatusid,
+            "MACHCODE": machine,
+            "JOBSTATUSID": np.random.choice([1, 2, 33]),
             "PLAN_COLOUR": colour,
             "DUEDATE": duedate,
-            "PLANSTARTDATE": planstartdate,
+            "PLANSTARTDATE": planstart,
             "QUANTITY": qty,
             "COLCOUNT": colcount,
-            "MACHINE1A": machine1a,
-            "MACHINE1B": machine1b,
-            "MACHINE1C": machine1c,
-            "PROCESS_COUNT": proc_count,
-            "BOARD_ARRIVAL_DATE": board_arrival,
+            "MACHINE1A": "PROC" if proc >= 1 else "",
+            "MACHINE1B": "PROC" if proc >= 2 else "",
+            "MACHINE1C": "PROC" if proc >= 3 else "",
+            "PROCESS_COUNT": proc,
+            "BOARD_ARRIVAL_DATE": board_date,
             "DURATION_MIN": duration_min,
-            "BOARD_ARRIVAL_USED": board_arrival_used,
+            "BOARD_ARRIVAL_USED": board_date + timedelta(hours=17),
             "FREEZE_FLAG": freeze_flag,
             "IS_EASY": is_easy,
             "IS_HARD": is_hard,
         }
     )
 
-# =========================================================
-# BUILD DATAFRAME & SAVE
-# =========================================================
-df = pd.DataFrame(records)
-df = df.sort_values("DUEDATE").reset_index(drop=True)
-df.to_excel(OUTPUT_PATH, index=False)
+df = pd.DataFrame(rows)
 
-print(f"✅ Synthetic dataset generated: {OUTPUT_PATH}")
-print(df.head(10))
+
+# sanity: ensure every machine has both easy and hard somewhere (for R-6)
+def ensure_mix(df):
+    for m in MACHINES:
+        sub = df[df["MACHCODE"] == m]
+        if sub["IS_EASY"].sum() == 0:
+            idx = (
+                df[(df["IS_EASY"] == 1)]
+                .sample(1, random_state=np.random.randint(9999))
+                .index
+            )
+            df.loc[idx, "MACHCODE"] = m
+        if sub["IS_HARD"].sum() == 0:
+            idx = (
+                df[(df["IS_HARD"] == 1)]
+                .sample(1, random_state=np.random.randint(9999))
+                .index
+            )
+            df.loc[idx, "MACHCODE"] = m
+    return df
+
+
+df = ensure_mix(df)
+
+# export
+df.to_excel(OUTPUT_PATH, index=False)
+print("✅ Saved:", OUTPUT_PATH)
+print(df.groupby(["MACHCODE", "IS_EASY", "IS_HARD"]).size().unstack(fill_value=0))
